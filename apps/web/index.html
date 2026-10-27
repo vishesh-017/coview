@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta
+      name="description"
+      content="CoView — real-time collaborative video streaming. Create a room, share the link, watch in sync."
+    />
+    <title>CoView</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <!-- The YouTube IFrame API is deliberately NOT loaded here. Fetching it on
+         every page load would hand Google each visitor's IP address before they
+         have played anything (see /privacy §7.1); the YouTube player adapter
+         injects it on demand instead — src/sync/players/YouTubePlayer.ts. -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
