@@ -1,0 +1,304 @@
+# CoView — Portainer-friendly stack.
+#
+# Four containers. Only the first joins your pre-existing external `proxy`
+# network and is reachable from the edge; the other three sit on the private
+# `coview-private` network defined at the bottom:
+#   • coview-web   — Nginx serving the React build; reverse-proxies
+#                          /api and /ws to the server (so your edge proxy only
+#                          needs to point at this one container).
+#   • coview-sync   — the Rust sync engine (in-memory room state) plus the
+#                          per-room ffmpeg → HLS proxy and the SQLite accounts DB.
+#   • coview-extract — yt-dlp sidecar: page URL → stream URLs + subtitles.
+#   • coview-pot   — PO-token provider for YouTube caption attestation.
+#
+# This file deliberately declares no `build:` contexts, so it can be pasted
+# straight into Portainer's web editor. Build the three first-party images on
+# the host once, then deploy — the `image:` tags below match:
+#   docker build -t coview-sync:latest   ./services/sync
+#   docker build -t coview-web:latest   ./apps/web
+#   docker build -t coview-extract:latest ./services/extract
+#   docker compose up -d
+# (coview-pot is pulled from Docker Hub.)
+#
+# The only network created here is `coview-private`; the external `proxy`
+# network your reverse proxy (NPM/Traefik/Caddy) lives on must already exist.
+# No host bind-mounts are used, so it transplants cleanly into Portainer — the shared
+# state is the two named volumes at the bottom: `coview-hls` (tmpfs,
+# scratch) and `coview-store` (durable, the accounts database).
+
+# Shared defaults. YAML anchors keep these identical across services without
+# four copies drifting apart.
+x-logging: &logging
+  # Without this, json-file logs grow unbounded and eventually fill
+  # /var/lib/docker/containers -- taking the host down, not just the stack.
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-security: &security
+  # None of these services needs to gain privileges or hold capabilities.
+  # ffmpeg, yt-dlp and nginx all run fine without them.
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  coview-sync:
+    image: coview-sync:latest
+    container_name: coview-sync
+    restart: unless-stopped
+    <<: *security
+    logging: *logging
+    # No limits at all previously: one runaway ffmpeg or a yt-dlp burst could
+    # OOM the host and take down all four containers, not just itself.
+    mem_limit: 2g
+    cpus: "2.0"
+    pids_limit: 512
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3000
+      # Lock this to your public https origin in production. "*" reflects any
+      # origin (fine for testing). Comma-separate to allow several.
+      - CORS_ORIGIN=${PUBLIC_ORIGIN:-*}
+      - RUST_LOG=${LOG_LEVEL:-info}
+      # Whose X-Real-IP / X-Forwarded-For we believe when keying per-IP rate
+      # limits. Bare name on purpose: it passes the value through only when
+      # actually set, so leaving it out means "unset" (default: private space,
+      # covering the coview-web hop) rather than "" ("trust nothing").
+      - TRUSTED_PROXIES
+      # yt-dlp resolver sidecar (Vimeo/Twitch/Reddit/…). Set to "" to disable —
+      # subtitles then return 501 and non-direct links go to ffmpeg unresolved.
+      - RESOLVER_URL=${RESOLVER_URL:-http://coview-extract:8080}
+      # Allow pasting media URLs that resolve to private/LAN addresses (your
+      # Jellyfin, a NAS, …). Off by default: on a public instance this is an
+      # SSRF hole into the Docker network. Applies to server and resolver alike.
+      - ALLOW_PRIVATE_URLS=${ALLOW_PRIVATE_URLS:-false}
+      # Optional accounts (SQLite on the coview-store volume below). Guests
+      # need nothing; registering unlocks persistent custom room URLs.
+      - DATABASE_PATH=/data/coview.sqlite
+      # Set to "false" to close signups (existing accounts keep working).
+      - REGISTRATION_ENABLED=${REGISTRATION_ENABLED:-true}
+      # Max custom room names one account may hold.
+      - MAX_ROOMS_PER_USER=${MAX_ROOMS_PER_USER:-5}
+      # Session cookie is HTTPS-only by default; set "false" only for a
+      # plain-HTTP LAN install (no reverse proxy / no TLS).
+      - COOKIE_SECURE=${COOKIE_SECURE:-true}
+      # Optional tunables. Bare names, not NAME=${NAME:-default}: compose then
+      # passes each through ONLY when it is actually set in your environment or
+      # .env, and the server falls back to its own default otherwise. That
+      # keeps the defaults in exactly one place (services/sync/src/config.rs) instead
+      # of duplicating them here where the two copies would drift.
+      #
+      # These used to be commented out, while README.md claimed every knob was
+      # env-overridable with no rebuild -- compose only substitutes variables it
+      # textually references, so putting them in .env did nothing.
+      - MAX_USERS_PER_ROOM
+      - MAX_ROOMS
+      - MAX_QUEUE_LENGTH
+      - EMPTY_ROOM_TTL_MS
+      - RECONNECT_GRACE_MS
+      - HEARTBEAT_MS
+      - DRIFT_TOLERANCE_SEC
+      - CHAT_HISTORY_LIMIT
+      - SESSION_TTL_DAYS
+      - ALLOWED_RATES
+      - HLS_SEGMENT_SEC
+      - STREAM_AUDIO_BITRATE
+      - STREAM_READY_TIMEOUT_SEC
+      - STREAM_MAX_BYTES
+      - STREAMS_DIR
+    depends_on:
+      coview-extract:
+        condition: service_healthy
+    networks:
+      coview-private:
+        # Distinct alias, and the name nginx.conf actually proxies to.
+        #
+        # coview-web sits on BOTH networks, and Docker's embedded DNS
+        # resolves a name across all of a container's networks. If anything on
+        # the shared `proxy` network is also called "coview-sync" -- which
+        # is exactly the case mid-rollout, while the previous stack's
+        # container_name is still attached -- then `proxy_pass
+        # http://coview-sync:3000` can silently reach the OLD container.
+        # This was observed: a test client resolved coview-sync to the
+        # previous stack's IP and proxied to it. A name that exists only here
+        # cannot be shadowed.
+        aliases:
+          - coview-sync-int
+    # The on-the-fly HLS proxy writes /dev/shm/streams/{room}/… here and Nginx
+    # in coview-web serves the same files directly — the volume MUST be
+    # mounted in both containers or every non-YouTube stream 404s.
+    volumes:
+      - coview-hls:/dev/shm/streams
+      # Accounts + registered room names (SQLite). Plain local volume — unlike
+      # the streams tmpfs this must survive restarts. Back up by copying the
+      # one .db file inside.
+      - coview-store:/data
+    healthcheck:
+      # 127.0.0.1, not localhost: avoids an IPv6 (::1) lookup the server doesn't bind.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Internal-only: turns Vimeo/Twitch/Reddit/… page URLs into direct streams via
+  # yt-dlp. Reached only by coview-sync over the Docker network — there is
+  # no edge route to it.
+  coview-extract:
+    image: coview-extract:latest
+    container_name: coview-extract
+    restart: unless-stopped
+    <<: *security
+    logging: *logging
+    # No limits at all previously: one runaway ffmpeg or a yt-dlp burst could
+    # OOM the host and take down all four containers, not just itself.
+    mem_limit: 1g
+    cpus: "1.5"
+    pids_limit: 256
+    environment:
+      # PO-token provider used for YouTube subtitle extraction (see
+      # coview-pot below). Set to "" to disable — subtitle listing still
+      # works, but auto-translated tracks lose their attestation tokens and
+      # will usually be rejected by YouTube.
+      - POT_PROVIDER_URL=${POT_PROVIDER_URL:-http://coview-pot:4416}
+      # Same SSRF policy as the server (yt-dlp fetches user-pasted URLs).
+      - ALLOW_PRIVATE_URLS=${ALLOW_PRIVATE_URLS:-false}
+      # Optional tunables (defaults live in services/extract/app.py). Bare names, so
+      # each is passed through only when set — see the note on the server's
+      # block above.
+      - RESOLVE_TIMEOUT
+      - SUBS_CACHE_TTL
+      - BODY_CACHE_MAX_BYTES
+      - RESOLVER_MAX_CONCURRENT
+      - RESOLVER_SLOT_WAIT
+      - RESOLVER_LOG
+    depends_on:
+      coview-pot:
+        condition: service_healthy
+    networks:
+      - coview-private
+    healthcheck:
+      # The image defines its own, but compose needs one declared here for
+      # `condition: service_healthy` above to gate on.
+      test: ["CMD", "python", "-c",
+             "import urllib.request,os;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8080')+'/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Internal-only: mints YouTube "PO tokens" (BotGuard attestation) for the
+  # resolver's subtitle extraction. YouTube requires these on caption requests
+  # for auto-translated languages; without them viewers' browsers get 429s.
+  coview-pot:
+    # Pinned, and MUST match POT_PLUGIN_VERSION in services/extract/Dockerfile --
+    # upstream requires the plugin and this provider server to be the same
+    # version. They used to float independently (:latest here, --upgrade
+    # there), which breaks PO tokens silently and therefore auto-translated
+    # subtitles.
+    image: brainicism/bgutil-ytdlp-pot-provider:1.2.2
+    container_name: coview-pot
+    restart: unless-stopped
+    <<: *security
+    logging: *logging
+    # No limits at all previously: one runaway ffmpeg or a yt-dlp burst could
+    # OOM the host and take down all four containers, not just itself.
+    mem_limit: 512m
+    cpus: "0.5"
+    pids_limit: 128
+    networks:
+      - coview-private
+    healthcheck:
+      # Node image (no python inside); the provider listens on 4416 and its
+      # health endpoint is GET /ping.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4416/ping').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  coview-web:
+    image: coview-web:latest
+    container_name: coview-web
+    restart: unless-stopped
+    # The stock nginx image starts as root, chowns its cache dirs, then drops
+    # to the nginx user -- so a bare `cap_drop: ALL` makes it fail to start
+    # with chown("/var/cache/nginx/client_temp") EPERM. Add back only what it
+    # actually needs. (nginxinc/nginx-unprivileged would remove the need
+    # entirely, but it listens on 8080 and that changes the edge proxy config.)
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - NET_BIND_SERVICE
+    <<: *security
+    logging: *logging
+    # No limits at all previously: one runaway ffmpeg or a yt-dlp burst could
+    # OOM the host and take down all four containers, not just itself.
+    mem_limit: 256m
+    cpus: "0.5"
+    pids_limit: 128
+    depends_on:
+      coview-sync:
+        condition: service_healthy
+    networks:
+      # The only service on both: it terminates the edge and proxies inward.
+      - proxy
+      - coview-private
+    # Read side of the shared RAM disk: nginx.conf aliases /api/streams/ to
+    # /dev/shm/streams/ and serves the playlists/segments with no upstream hop.
+    volumes:
+      - coview-hls:/dev/shm/streams
+    healthcheck:
+      # 127.0.0.1, not localhost: busybox wget won't fall back from IPv6 (::1)
+      # to IPv4, and nginx listens on IPv4 only.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  # The pre-existing edge network your reverse proxy lives on. ONLY
+  # coview-web joins it now.
+  proxy:
+    external: true
+
+  # Private network for the three internal services.
+  #
+  # The header comment above used to claim "only the first is reachable from
+  # the edge; the rest are internal" while all four sat on `proxy` -- the same
+  # L2 segment as the reverse proxy, Portainer, and every other container
+  # attached to it. Anything there could reach coview-sync:3000 and
+  # coview-extract:8080 directly, bypassing Nginx and therefore the CSP,
+  # the real-IP handling and the rate limiter.
+  #
+  # NOT `internal: true`: that would also cut off egress, and the server and
+  # resolver must reach the public internet (ffmpeg fetches media, yt-dlp
+  # fetches pages, the oEmbed title lookup). A separate bridge network gives
+  # isolation from `proxy` while keeping outbound NAT.
+  coview-private:
+    driver: bridge
+
+volumes:
+  # RAM-backed scratch space for the per-room HLS proxy, shared between the
+  # server (ffmpeg writes) and the client (nginx reads). tmpfs so segments never
+  # touch disk; sized because a proxied VOD is kept in full until the room ends
+  # (a 2h 1080p remux can reach a few GB — raise STREAMS_TMPFS_SIZE if you watch
+  # long/high-bitrate files). mode=1777 (like /dev/shm) because the server runs
+  # as uid 10001 and nginx reads as uid 101.
+  # NOTE: driver_opts are frozen at first creation. To change the size later:
+  #   docker compose -p CoView down && docker volume rm CoView_coview-hls
+  coview-hls:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "size=${STREAMS_TMPFS_SIZE:-2g},mode=1777"
+
+  # Durable home of the accounts database (users, sessions, registered room
+  # names). Deleting this volume deletes every account and claimed room URL.
+  coview-store:
+    driver: local
